@@ -187,9 +187,7 @@ def run() -> None:
     model = PPO.load(str(MODEL_PATH))
     print(f"[modelo] V14 carregado de {MODEL_PATH}")
 
-    # 4. Observacao: ultimos window_size candles
-    from env.trading_env import TradingEnv
-    # Usa os ultimos dados para montar a observacao manualmente
+    # 4. Observacao: ultimos window_size candles (montada manualmente)
     window = ENV["window_size"]
     from features.builder import FEATURE_COLS
     obs_window = df[FEATURE_COLS].iloc[-window:].values.flatten().astype("float32")
