@@ -37,7 +37,7 @@ from features.builder import build_features
 # Configuracao
 # ------------------------------------------------------------------
 
-SYMBOL        = "BTCUSDT"
+SYMBOL        = "XBTUSD"    # par BTC/USD no Kraken (exchange americana — sem bloqueio geo)
 TIMEFRAME     = "1h"
 MODEL_PATH    = Path(WALK_FORWARD["model_dir"]) / "wf_window_4.zip"
 LOG_PATH      = Path(__file__).parent / "log.csv"
@@ -48,70 +48,48 @@ ACTION_MAP    = {0: "FLAT", 1: "LONG", 2: "SHORT"}
 ACTION_TO_POS = {0: 0, 1: 1, 2: -1}
 
 # ------------------------------------------------------------------
-# Busca candles ao vivo via Bybit (sem restricao geografica)
+# Busca candles ao vivo via Kraken (exchange EUA — sem bloqueio geo)
 # ------------------------------------------------------------------
 
 def fetch_live_candles() -> pd.DataFrame:
     """
-    Busca os ultimos CANDLES_NEEDED candles 1h do BTC/USDT via API publica
-    da Bybit. Nao requer autenticacao e funciona de qualquer servidor do
-    mundo, incluindo GitHub Actions (EUA).
-    Bybit limita 200 candles por request — paginamos automaticamente.
+    Busca os ultimos CANDLES_NEEDED candles 1h do BTC/USD via API publica
+    do Kraken. Nao requer autenticacao e funciona de qualquer servidor,
+    incluindo GitHub Actions (Azure EUA). Retorna ate 720 candles por request.
     """
-    url = "https://api.bybit.com/v5/market/kline"
-    all_rows: list = []
-    end_time: int | None = None
+    url = "https://api.kraken.com/0/public/OHLC"
+    params = {
+        "pair":     SYMBOL,
+        "interval": 60,     # minutos
+    }
 
-    print(f"[bybit] Buscando {CANDLES_NEEDED} candles 1h de {SYMBOL}...")
+    print(f"[kraken] Buscando candles 1h de {SYMBOL}...")
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
 
-    for _ in range(5):          # maximo 5 requests (~1000 candles)
-        params: dict = {
-            "category": "spot",
-            "symbol":   SYMBOL,
-            "interval": "60",   # 60 minutos = 1h
-            "limit":    200,    # maximo permitido pela Bybit
-        }
-        if end_time is not None:
-            params["end"] = str(end_time)
+    if data["error"]:
+        raise RuntimeError(f"[kraken] Erro na API: {data['error']}")
 
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+    # Nome da chave varia ligeiramente (ex: 'XXBTZUSD')
+    pair_key = [k for k in data["result"] if k != "last"][0]
+    rows = data["result"][pair_key]
 
-        if data.get("retCode", -1) != 0:
-            raise RuntimeError(f"[bybit] Erro na API: {data}")
-
-        rows = data["result"]["list"]   # ordem decrescente (mais novo primeiro)
-        if not rows:
-            break
-
-        all_rows.extend(rows)
-
-        if len(all_rows) >= CANDLES_NEEDED:
-            break
-
-        # Proxima pagina: busca candles mais antigos
-        end_time = int(rows[-1][0]) - 1
-
-    # Monta DataFrame
-    df = pd.DataFrame(all_rows, columns=[
-        "timestamp", "open", "high", "low", "close", "volume", "turnover"
+    df = pd.DataFrame(rows, columns=[
+        "timestamp", "open", "high", "low", "close", "vwap", "volume", "count"
     ])
     df = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+    # Kraken usa timestamps em SEGUNDOS (nao ms)
     df["timestamp"] = pd.to_datetime(
-        df["timestamp"].astype(np.int64), unit="ms", utc=True
+        df["timestamp"].astype(np.int64), unit="s", utc=True
     )
     df[["open", "high", "low", "close", "volume"]] = (
         df[["open", "high", "low", "close", "volume"]].astype(float)
     )
-    df = (
-        df.sort_values("timestamp")
-          .drop_duplicates("timestamp")
-          .set_index("timestamp")
-    )
+    df = df.sort_values("timestamp").set_index("timestamp")
     df = df.iloc[-CANDLES_NEEDED:]   # garante tamanho exato
 
-    print(f"[bybit] {len(df)} candles recebidos. Ultimo: {df.index[-1]}")
+    print(f"[kraken] {len(df)} candles recebidos. Ultimo: {df.index[-1]}")
     return df
 
 
