@@ -33,11 +33,10 @@ jobs:
 
       # 3. Instala dependencias (usa cache do pip para ser rapido)
       - name: Instalar dependencias
-        run: pip install -r crypto-agent/requirements.txt
+        run: pip install -r requirements.txt
 
       # 4. Roda o agente (1 decisao + atualiza log.csv)
       - name: Rodar agente
-        working-directory: crypto-agent
         env:
           BINANCE_API_KEY:    ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
@@ -48,7 +47,7 @@ jobs:
         run: |
           git config user.name  "paper-trading-bot"
           git config user.email "bot@paper-trading"
-          git add crypto-agent/paper_trading/log.csv
+          git add paper_trading/log.csv
           git diff --staged --quiet || git commit -m "log: $(date -u '+%Y-%m-%d %H:%M UTC')"
           git push
 
@@ -73,5 +72,4 @@ jobs:
         run: pip install pandas numpy
 
       - name: Gerar relatorio semanal
-        working-directory: crypto-agent
         run: python paper_trading/report.py
