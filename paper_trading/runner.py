@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import pandas as pd
-import ccxt
+import requests
 from stable_baselines3 import PPO
 
 from config import ENV, WALK_FORWARD
@@ -37,7 +37,7 @@ from features.builder import build_features
 # Configuracao
 # ------------------------------------------------------------------
 
-SYMBOL        = "BTC/USDT"
+SYMBOL        = "BTCUSDT"          # formato da API REST publica da Binance
 TIMEFRAME     = "1h"
 MODEL_PATH    = Path(WALK_FORWARD["model_dir"]) / "wf_window_4.zip"
 LOG_PATH      = Path(__file__).parent / "log.csv"
@@ -48,28 +48,38 @@ ACTION_MAP    = {0: "FLAT", 1: "LONG", 2: "SHORT"}
 ACTION_TO_POS = {0: 0, 1: 1, 2: -1}
 
 # ------------------------------------------------------------------
-# Busca candles ao vivo
+# Busca candles ao vivo (API REST publica — sem restricao geografica)
 # ------------------------------------------------------------------
 
 def fetch_live_candles() -> pd.DataFrame:
     """
-    Busca os ultimos CANDLES_NEEDED candles 1h do BTC/USDT na Binance.
-    Usa API Key se disponivel (aumenta rate limit), senão usa endpoint publico.
+    Busca os ultimos CANDLES_NEEDED candles 1h do BTC/USDT via API publica
+    da Binance (/api/v3/klines). Nao requer chave de API nem autenticacao.
+    Funciona a partir de qualquer servidor, incluindo GitHub Actions (EUA).
     """
-    api_key    = os.getenv("BINANCE_API_KEY", "")
-    api_secret = os.getenv("BINANCE_API_SECRET", "")
-
-    exchange = ccxt.binance({
-        "apiKey":    api_key    or None,
-        "secret":    api_secret or None,
-        "enableRateLimit": True,
-    })
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol":   SYMBOL,
+        "interval": TIMEFRAME,
+        "limit":    CANDLES_NEEDED,
+    }
 
     print(f"[binance] Buscando {CANDLES_NEEDED} candles {TIMEFRAME} de {SYMBOL}...")
-    raw = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=CANDLES_NEEDED)
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    raw = resp.json()
 
-    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    cols = [
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "n_trades",
+        "taker_buy_base", "taker_buy_quote", "ignore",
+    ]
+    df = pd.DataFrame(raw, columns=cols)
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df[["open", "high", "low", "close", "volume"]] = (
+        df[["open", "high", "low", "close", "volume"]].astype(float)
+    )
     df = df.set_index("timestamp").sort_index()
 
     print(f"[binance] {len(df)} candles recebidos. Ultimo: {df.index[-1]}")
