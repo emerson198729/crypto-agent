@@ -1,0 +1,22 @@
+# Dados e indicadores
+ccxt>=4.2.0
+pandas>=2.1.0
+numpy>=1.26.0
+ta>=0.11.0
+pyarrow>=15.0.0
+
+# Ambiente RL
+gymnasium>=0.29.0
+
+# Agente RL
+stable-baselines3>=2.3.0
+torch>=2.2.0
+
+# Visualização e monitoramento
+matplotlib>=3.8.0
+tensorboard>=2.16.0
+
+# Utilitários
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+rich>=13.7.0

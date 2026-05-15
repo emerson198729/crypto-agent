@@ -1,0 +1,40 @@
+# Ambiente virtual Python (centenas de MB — nao sobe)
+.venv/
+venv/
+env/
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Cache de dados (parquet — rebaixado a cada run)
+data/*.parquet
+*.parquet
+
+# Logs de treinamento (TensorBoard)
+runs/
+
+# Logs locais de walk-forward (so para desenvolvimento)
+wf_v*.log
+wf_v*_err.log
+
+# Modelos intermediarios (so o wf_window_4 vai pro repo)
+models/wf/wf_window_1.zip
+models/wf/wf_window_2.zip
+models/wf/wf_window_3.zip
+models/best/
+
+# Graficos gerados localmente
+results/*.png
+evaluation.png
+
+# Variaveis de ambiente locais
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
