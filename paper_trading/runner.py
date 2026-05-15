@@ -37,7 +37,7 @@ from features.builder import build_features
 # Configuracao
 # ------------------------------------------------------------------
 
-SYMBOL        = "BTCUSDT"          # formato da API REST publica da Binance
+SYMBOL        = "BTCUSDT"
 TIMEFRAME     = "1h"
 MODEL_PATH    = Path(WALK_FORWARD["model_dir"]) / "wf_window_4.zip"
 LOG_PATH      = Path(__file__).parent / "log.csv"
@@ -48,41 +48,70 @@ ACTION_MAP    = {0: "FLAT", 1: "LONG", 2: "SHORT"}
 ACTION_TO_POS = {0: 0, 1: 1, 2: -1}
 
 # ------------------------------------------------------------------
-# Busca candles ao vivo (API REST publica — sem restricao geografica)
+# Busca candles ao vivo via Bybit (sem restricao geografica)
 # ------------------------------------------------------------------
 
 def fetch_live_candles() -> pd.DataFrame:
     """
     Busca os ultimos CANDLES_NEEDED candles 1h do BTC/USDT via API publica
-    da Binance (/api/v3/klines). Nao requer chave de API nem autenticacao.
-    Funciona a partir de qualquer servidor, incluindo GitHub Actions (EUA).
+    da Bybit. Nao requer autenticacao e funciona de qualquer servidor do
+    mundo, incluindo GitHub Actions (EUA).
+    Bybit limita 200 candles por request — paginamos automaticamente.
     """
-    url = "https://api.binance.com/api/v3/klines"
-    params = {
-        "symbol":   SYMBOL,
-        "interval": TIMEFRAME,
-        "limit":    CANDLES_NEEDED,
-    }
+    url = "https://api.bybit.com/v5/market/kline"
+    all_rows: list = []
+    end_time: int | None = None
 
-    print(f"[binance] Buscando {CANDLES_NEEDED} candles {TIMEFRAME} de {SYMBOL}...")
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    raw = resp.json()
+    print(f"[bybit] Buscando {CANDLES_NEEDED} candles 1h de {SYMBOL}...")
 
-    cols = [
-        "timestamp", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "n_trades",
-        "taker_buy_base", "taker_buy_quote", "ignore",
-    ]
-    df = pd.DataFrame(raw, columns=cols)
+    for _ in range(5):          # maximo 5 requests (~1000 candles)
+        params: dict = {
+            "category": "spot",
+            "symbol":   SYMBOL,
+            "interval": "60",   # 60 minutos = 1h
+            "limit":    200,    # maximo permitido pela Bybit
+        }
+        if end_time is not None:
+            params["end"] = str(end_time)
+
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("retCode", -1) != 0:
+            raise RuntimeError(f"[bybit] Erro na API: {data}")
+
+        rows = data["result"]["list"]   # ordem decrescente (mais novo primeiro)
+        if not rows:
+            break
+
+        all_rows.extend(rows)
+
+        if len(all_rows) >= CANDLES_NEEDED:
+            break
+
+        # Proxima pagina: busca candles mais antigos
+        end_time = int(rows[-1][0]) - 1
+
+    # Monta DataFrame
+    df = pd.DataFrame(all_rows, columns=[
+        "timestamp", "open", "high", "low", "close", "volume", "turnover"
+    ])
     df = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"].astype(np.int64), unit="ms", utc=True
+    )
     df[["open", "high", "low", "close", "volume"]] = (
         df[["open", "high", "low", "close", "volume"]].astype(float)
     )
-    df = df.set_index("timestamp").sort_index()
+    df = (
+        df.sort_values("timestamp")
+          .drop_duplicates("timestamp")
+          .set_index("timestamp")
+    )
+    df = df.iloc[-CANDLES_NEEDED:]   # garante tamanho exato
 
-    print(f"[binance] {len(df)} candles recebidos. Ultimo: {df.index[-1]}")
+    print(f"[bybit] {len(df)} candles recebidos. Ultimo: {df.index[-1]}")
     return df
 
 
