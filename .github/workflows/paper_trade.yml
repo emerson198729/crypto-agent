@@ -1,9 +1,10 @@
 name: Paper Trading 24/7
 
 on:
-  # Roda no inicio de cada hora, todos os dias
+  # Dois horarios por hora: se o das :02 for pulado, o das :32 recupera
   schedule:
-    - cron: "2 * * * *"   # 2 minutos apos a hora cheia (aguarda candle fechar)
+    - cron: "2 * * * *"    # tentativa principal: 2 min apos hora cheia
+    - cron: "32 * * * *"   # fallback: 32 min apos hora cheia
 
   # Permite rodar manualmente pelo GitHub para testar
   workflow_dispatch:

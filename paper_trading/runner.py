@@ -169,6 +169,16 @@ def run() -> None:
     print(f"  PAPER TRADING — {now}")
     print(f"{'='*55}")
 
+    # Verificacao de duplicata: evita registrar duas vezes a mesma hora
+    # (acontece quando o cron das :02 E o das :32 rodam na mesma hora)
+    current_hour = pd.Timestamp.now(tz="UTC").floor("h")
+    log_check = load_log()
+    if not log_check.empty:
+        last_ts = pd.to_datetime(log_check["timestamp"].iloc[-1], utc=True)
+        if last_ts >= current_hour:
+            print(f"[runner] Candle para {current_hour} ja registrado ({last_ts}). Saindo.")
+            sys.exit(0)
+
     # 1. Dados ao vivo
     df_raw = fetch_live_candles()
 
