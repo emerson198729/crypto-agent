@@ -48,6 +48,18 @@ ACTION_MAP    = {0: "FLAT", 1: "LONG", 2: "SHORT"}
 ACTION_TO_POS = {0: 0, 1: 1, 2: -1}
 
 # ------------------------------------------------------------------
+# Overlay de risco (camada B do plano) — independente do modelo
+# ------------------------------------------------------------------
+# Stop-loss por posicao: se o prejuizo nao-realizado da posicao aberta
+# passar deste limite, o runner FORCA saida para FLAT, ignorando o modelo.
+# Ataca diretamente o vies de "segurar LONG durante a queda".
+STOP_LOSS_PCT  = 0.04    # 4% de prejuizo na posicao -> corta
+
+# Apos um stop, fica FLAT por COOLDOWN_BARS candles antes de reentrar.
+# Evita reentrar na "faca caindo" logo apos ser stopado.
+COOLDOWN_BARS  = 3
+
+# ------------------------------------------------------------------
 # Busca candles ao vivo via Kraken (exchange EUA — sem bloqueio geo)
 # ------------------------------------------------------------------
 
@@ -160,7 +172,40 @@ def apply_trade_cost(equity: float, old_pos: int, new_pos: int) -> float:
 
 
 # ------------------------------------------------------------------
-# Runner principal
+# Reconstrucao de estado a partir do log
+# ------------------------------------------------------------------
+
+def reconstruct_entry_price(log: pd.DataFrame, position: int) -> float:
+    """Preco em que a posicao atualmente aberta foi iniciada."""
+    if log.empty or position == 0:
+        return 0.0
+    # Procura de tras pra frente a linha onde a posicao mudou para o valor atual
+    for i in range(len(log) - 1, -1, -1):
+        row = log.iloc[i]
+        if int(row["posicao_atual"]) == position and int(row["posicao_anterior"]) != position:
+            return float(row["preco"])
+    # Nao achou transicao explicita — usa o preco mais antigo com essa posicao
+    same = log[log["posicao_atual"] == position]
+    return float(same.iloc[0]["preco"]) if not same.empty else 0.0
+
+
+def steps_since_entry(log: pd.DataFrame, position: int) -> int:
+    """Quantos candles a posicao atual ja durou (para time_in_position)."""
+    if log.empty or position == 0:
+        return 0
+    count = 0
+    for i in range(len(log) - 1, -1, -1):
+        if int(log.iloc[i]["posicao_atual"]) == position:
+            count += 1
+            if int(log.iloc[i]["posicao_anterior"]) != position:
+                break
+        else:
+            break
+    return count
+
+
+# ------------------------------------------------------------------
+# Runner principal — processa TODOS os candles perdidos (catch-up)
 # ------------------------------------------------------------------
 
 def run() -> None:
@@ -169,109 +214,141 @@ def run() -> None:
     print(f"  PAPER TRADING — {now}")
     print(f"{'='*55}")
 
-    # Verificacao de duplicata: evita registrar duas vezes a mesma hora
-    # (acontece quando o cron das :02 E o das :32 rodam na mesma hora)
+    from features.builder import FEATURE_COLS
+    window       = ENV["window_size"]
+    initial_cap  = float(ENV["initial_capital"])
     current_hour = pd.Timestamp.now(tz="UTC").floor("h")
-    log_check = load_log()
-    if not log_check.empty:
-        last_ts = pd.to_datetime(log_check["timestamp"].iloc[-1], utc=True)
-        if last_ts >= current_hour:
-            print(f"[runner] Candle para {current_hour} ja registrado ({last_ts}). Saindo.")
-            sys.exit(0)
 
-    # 1. Dados ao vivo
-    df_raw = fetch_live_candles()
-
-    # 2. Features (identico ao treino)
-    df = build_features(df_raw).reset_index(drop=True)
-
-    current_price = float(df["close"].iloc[-1])
-    prev_price    = float(df["close"].iloc[-2])
-
-    # 3. Modelo
+    # 1. Modelo
     if not MODEL_PATH.exists():
         print(f"[ERRO] Modelo nao encontrado: {MODEL_PATH}")
-        print("       Certifique-se de que models/wf/wf_window_4.zip esta no repositorio.")
         sys.exit(1)
-
     model = PPO.load(str(MODEL_PATH))
-    print(f"[modelo] V14 carregado de {MODEL_PATH}")
+    print(f"[modelo] carregado de {MODEL_PATH}")
 
-    # 4. Observacao: ultimos window_size candles (montada manualmente)
-    window = ENV["window_size"]
-    from features.builder import FEATURE_COLS
-    obs_window = df[FEATURE_COLS].iloc[-window:].values.flatten().astype("float32")
-    obs_window = np.clip(obs_window, -5.0, 5.0)
+    # 2. Dados ao vivo (mantem timestamp no indice)
+    df_raw = fetch_live_candles()
+    df     = build_features(df_raw)              # indice = timestamp
+    feats  = df[FEATURE_COLS].values.astype("float32")
+    closes = df["close"].values.astype(float)
+    times  = df.index
 
-    # Estado de conta simulado (baseado no log)
-    log          = load_log()
+    # 3. Estado inicial a partir do log
+    log = load_log()
     old_position, equity, n_trades = get_current_state(log)
+    entry_price = reconstruct_entry_price(log, old_position)
+    steps_in_pos = steps_since_entry(log, old_position)
+    peak_equity  = float(log["equity"].max()) if not log.empty else equity
+    last_ts      = pd.to_datetime(log["timestamp"].iloc[-1], utc=True) if not log.empty else None
 
-    # Unrealized PnL e drawdown para completar obs de conta
-    entry_price = 0.0
-    if not log.empty and old_position != 0:
-        # Busca o preco da ultima entrada
-        entries = log[log["posicao_anterior"] == 0]
-        if not entries.empty:
-            entry_price = float(entries.iloc[-1]["preco"])
-
-    unrealized = (
-        old_position * (current_price - entry_price) / entry_price
-        if entry_price > 0 and old_position != 0 else 0.0
+    # Cooldown: ultimas decisoes registradas (para detectar STOP recente)
+    recent_decisions = (
+        list(log["decisao"].tail(COOLDOWN_BARS)) if not log.empty else []
     )
-    peak_equity = float(log["equity"].max()) if not log.empty else equity
-    drawdown    = (equity - peak_equity) / peak_equity if peak_equity > 0 else 0.0
-    time_norm   = 0.5  # aproximacao conservadora
 
-    account_obs = np.array(
-        [float(old_position), unrealized, drawdown, time_norm],
-        dtype="float32",
-    )
-    obs = np.concatenate([obs_window, account_obs])
+    # 4. Seleciona candles a processar: novos (apos last_ts) e ja FECHADOS (< hora atual)
+    new_rows = []
+    for i in range(max(window, 1), len(closes)):
+        ts = times[i]
+        if ts >= current_hour:
+            continue                       # candle ainda em formacao — ignora
+        if last_ts is not None and ts <= last_ts:
+            continue                       # ja registrado
+        if last_ts is None and i < len(closes) - 1:
+            continue                       # primeiro run: processa so o ultimo fechado
+        new_rows.append(i)
 
-    # 5. Decisao do agente
-    action, _ = model.predict(obs, deterministic=True)
-    action     = int(action)
-    new_position = ACTION_TO_POS[action]
-    decision_str = ACTION_MAP[action]
+    if not new_rows:
+        print("[runner] Nenhum candle novo fechado para processar. Saindo.")
+        return
 
-    # 6. Atualiza equity: primeiro aplica retorno do candle anterior, depois custo
-    equity, ret_candle = update_equity(equity, old_position, prev_price, current_price)
-    equity = apply_trade_cost(equity, old_position, new_position)
+    print(f"[runner] Processando {len(new_rows)} candle(s) novo(s)...")
 
-    if old_position != new_position:
-        n_trades += 1
+    # 5. Loop de catch-up — um passo por candle perdido
+    for i in new_rows:
+        price = closes[i]
+        prev  = closes[i - 1]
+        ret   = (price - prev) / prev if prev > 0 else 0.0
 
-    retorno_acumulado = (equity / ENV["initial_capital"] - 1.0) * 100.0
+        # 5a. Realiza o retorno do candle que fechou, sob a posicao que vinha aberta
+        equity *= (1.0 + old_position * ret)
 
-    # 7. Log
-    new_row = {
-        "timestamp":            pd.Timestamp.now(tz="UTC").floor("h"),
-        "preco":                round(current_price, 2),
-        "decisao":              decision_str,
-        "posicao_anterior":     old_position,
-        "posicao_atual":        new_position,
-        "equity":               round(equity, 4),
-        "retorno_candle_pct":   round(ret_candle, 4),
-        "retorno_acumulado_pct":round(retorno_acumulado, 4),
-        "n_trades":             n_trades,
-    }
-    log = pd.concat([log, pd.DataFrame([new_row])], ignore_index=True)
+        # 5b. Observacao: janela terminando neste candle + estado de conta
+        obs_window = np.clip(feats[i - window + 1:i + 1].flatten(), -5.0, 5.0)
+        unrealized = (
+            old_position * (price - entry_price) / entry_price
+            if entry_price > 0 and old_position != 0 else 0.0
+        )
+        drawdown  = (equity - peak_equity) / peak_equity if peak_equity > 0 else 0.0
+        time_norm = min(steps_in_pos / window, 1.0)
+        obs = np.concatenate([
+            obs_window,
+            np.array([float(old_position), unrealized, drawdown, time_norm], dtype="float32"),
+        ])
+
+        # 5c. Decisao do modelo
+        action, _    = model.predict(obs, deterministic=True)
+        model_pos    = ACTION_TO_POS[int(action)]
+        new_position = model_pos
+        decision_str = ACTION_MAP[int(action)]
+
+        # 5d. OVERLAY DE RISCO (independente do modelo)
+        # Cooldown: se houve STOP nos ultimos COOLDOWN_BARS candles, fica FLAT
+        in_cooldown = "STOP" in recent_decisions[-COOLDOWN_BARS:]
+        if in_cooldown:
+            new_position = 0
+            decision_str = "FLAT"
+
+        # Stop-loss: posicao aberta com prejuizo acima do limite -> corta
+        elif old_position != 0 and unrealized < -STOP_LOSS_PCT:
+            new_position = 0
+            decision_str = "STOP"
+
+        # 5e. Custo de transacao se mudou de posicao
+        if new_position != old_position:
+            n_trans = 1 if (old_position == 0 or new_position == 0) else 2
+            equity *= (1.0 - n_trans * (ENV["fee_rate"] + ENV["slippage_rate"]))
+            n_trades += 1
+            entry_price  = price
+            steps_in_pos = 0
+        else:
+            steps_in_pos += 1
+
+        peak_equity = max(peak_equity, equity)
+        retorno_acum = (equity / initial_cap - 1.0) * 100.0
+
+        row_data = {
+            "timestamp":             ts_floor(times[i]),
+            "preco":                 round(price, 2),
+            "decisao":               decision_str,
+            "posicao_anterior":      old_position,
+            "posicao_atual":         new_position,
+            "equity":                round(equity, 4),
+            "retorno_candle_pct":    round(ret * 100.0, 4),
+            "retorno_acumulado_pct": round(retorno_acum, 4),
+            "n_trades":              n_trades,
+        }
+        log = pd.concat([log, pd.DataFrame([row_data])], ignore_index=True)
+
+        recent_decisions.append(decision_str)
+        old_position = new_position
+
     save_log(log)
 
-    # 8. Saida no console (visivel nos logs do GitHub Actions)
-    trade_flag = " *** TRADE ***" if old_position != new_position else ""
-    print(f"\n  Preco atual:     ${current_price:,.2f}")
-    print(f"  Posicao anterior:{POSITION_MAP[old_position]}")
-    print(f"  Decisao agente:  {decision_str}{trade_flag}")
-    print(f"  Equity simulada: ${equity:,.2f}")
-    print(f"  Retorno acum.:   {retorno_acumulado:+.2f}%")
-    print(f"  Trades totais:   {n_trades}")
-    print(f"\n  Log salvo em:    {LOG_PATH.resolve()}")
+    # 6. Resumo da ultima decisao
+    last = log.iloc[-1]
+    print(f"\n  Candles processados: {len(new_rows)}")
+    print(f"  Preco atual:     ${float(last['preco']):,.2f}")
+    print(f"  Decisao final:   {last['decisao']}")
+    print(f"  Posicao atual:   {POSITION_MAP[int(last['posicao_atual'])]}")
+    print(f"  Equity simulada: ${float(last['equity']):,.2f}")
+    print(f"  Retorno acum.:   {float(last['retorno_acumulado_pct']):+.2f}%")
+    print(f"  Trades totais:   {int(last['n_trades'])}")
 
-    # Alerta de trade para facilitar leitura do log
-    if old_position != new_position:
-        print(f"\n  [!] MUDANCA DE POSICAO: {POSITION_MAP[old_position]} -> {POSITION_MAP[new_position]}")
+
+def ts_floor(ts) -> pd.Timestamp:
+    """Normaliza o timestamp do candle para a hora cheia em UTC."""
+    return pd.Timestamp(ts).tz_convert("UTC").floor("h")
 
 
 if __name__ == "__main__":
