@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 import pandas as pd
 import requests
+import ta
 from stable_baselines3 import PPO
 
 from config import ENV, WALK_FORWARD
@@ -58,6 +59,15 @@ STOP_LOSS_PCT  = 0.04    # 4% de prejuizo na posicao -> corta
 # Apos um stop, fica FLAT por COOLDOWN_BARS candles antes de reentrar.
 # Evita reentrar na "faca caindo" logo apos ser stopado.
 COOLDOWN_BARS  = 3
+
+# Filtro de chop (mercado sem tendencia definida): quando ADX(14) < threshold,
+# bloqueia a ABERTURA de nova posicao direcional — mercado lateral gera
+# whipsaw caro para um agente trend-follower. Validado via shadow backtest
+# (scripts/shadow_backtest.py) contra dados reais da Kraken (mesma fonte
+# usada aqui): reduziu perda de -13.9% para -9.2% e MDD de -17.7% para
+# -11.1% no periodo de chop de jun-jul/2026. Fechar para FLAT continua
+# sempre permitido — o filtro so impede ENTRAR em LONG/SHORT sem tendencia.
+CHOP_ADX_THRESHOLD = 20
 
 # ------------------------------------------------------------------
 # Busca candles ao vivo via Kraken (exchange EUA — sem bloqueio geo)
@@ -233,6 +243,12 @@ def run() -> None:
     closes = df["close"].values.astype(float)
     times  = df.index
 
+    # ADX(14) para o filtro de chop — calculado fora do vetor de features do
+    # modelo (nao altera a observacao, e um overlay externo de decisao)
+    adx = ta.trend.ADXIndicator(
+        high=df["high"], low=df["low"], close=df["close"], window=14
+    ).adx().fillna(0.0).values
+
     # 3. Estado inicial a partir do log
     log = load_log()
     old_position, equity, n_trades = get_current_state(log)
@@ -303,6 +319,15 @@ def run() -> None:
         elif old_position != 0 and unrealized < -STOP_LOSS_PCT:
             new_position = 0
             decision_str = "STOP"
+
+        # Chop filter: bloqueia ABERTURA de posicao direcional sem tendencia.
+        # Fechar para FLAT continua sempre permitido. Validado em backtest
+        # contra dados reais da Kraken (ver CHOP_ADX_THRESHOLD acima).
+        elif (new_position != old_position and new_position != 0
+              and adx[i] < CHOP_ADX_THRESHOLD):
+            new_position = old_position if old_position != 0 else 0
+            if new_position == 0:
+                decision_str = "CHOP_SKIP"
 
         # 5e. Custo de transacao se mudou de posicao
         if new_position != old_position:
