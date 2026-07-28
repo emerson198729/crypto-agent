@@ -67,7 +67,28 @@ COOLDOWN_BARS  = 3
 # usada aqui): reduziu perda de -13.9% para -9.2% e MDD de -17.7% para
 # -11.1% no periodo de chop de jun-jul/2026. Fechar para FLAT continua
 # sempre permitido — o filtro so impede ENTRAR em LONG/SHORT sem tendencia.
+#
+# NOTA (2026-07-28): reavaliado com 13 dias de producao real — o ganho NAO se
+# confirmou out-of-sample (contrafactual: -7.0% sem filtro vs -8.9% com).
+# Em 8 janelas moveis o efeito e ruidoso (ajuda em 5/8, sinal trocando).
+# Mantido por nao prejudicar na media, mas nao vale mais tuning.
 CHOP_ADX_THRESHOLD = 20
+
+# ------------------------------------------------------------------
+# CIRCUIT BREAKER — parada definitiva por drawdown
+# ------------------------------------------------------------------
+# O ambiente de TREINO (env/trading_env.py) trata ENV["max_drawdown_limit"]
+# como falha terminal: o episodio e encerrado. Producao nao tinha esse limite,
+# entao o agente seguiu operando muito alem do que o proprio design considera
+# aceitavel (-32.5% real vs -25% de limite).
+#
+# Com o breaker ativo o runner continua registrando o log (preco, equity,
+# drawdown) mas NUNCA abre posicao — decisao fica "HALTED". E irreversivel
+# por design: uma vez ultrapassado o limite, nao volta a operar sozinho mesmo
+# que a equity suba. Para retomar e preciso decisao humana explicita
+# (ex: resetar o log ou elevar o limite conscientemente).
+HALT_ON_DRAWDOWN   = True
+MAX_DRAWDOWN_HALT  = ENV["max_drawdown_limit"]   # 0.25 = -25%
 
 # ------------------------------------------------------------------
 # Busca candles ao vivo via Kraken (exchange EUA — sem bloqueio geo)
@@ -309,9 +330,14 @@ def run() -> None:
         decision_str = ACTION_MAP[int(action)]
 
         # 5d. OVERLAY DE RISCO (independente do modelo)
+        # CIRCUIT BREAKER (precedencia maxima): drawdown alem do limite de
+        # projeto -> fecha posicao e nunca mais abre. Ver MAX_DRAWDOWN_HALT.
+        if HALT_ON_DRAWDOWN and drawdown < -MAX_DRAWDOWN_HALT:
+            new_position = 0
+            decision_str = "HALTED"
+
         # Cooldown: se houve STOP nos ultimos COOLDOWN_BARS candles, fica FLAT
-        in_cooldown = "STOP" in recent_decisions[-COOLDOWN_BARS:]
-        if in_cooldown:
+        elif "STOP" in recent_decisions[-COOLDOWN_BARS:]:
             new_position = 0
             decision_str = "FLAT"
 
@@ -362,13 +388,23 @@ def run() -> None:
 
     # 6. Resumo da ultima decisao
     last = log.iloc[-1]
+    final_dd = (float(last["equity"]) - peak_equity) / peak_equity if peak_equity > 0 else 0.0
     print(f"\n  Candles processados: {len(new_rows)}")
     print(f"  Preco atual:     ${float(last['preco']):,.2f}")
     print(f"  Decisao final:   {last['decisao']}")
     print(f"  Posicao atual:   {POSITION_MAP[int(last['posicao_atual'])]}")
     print(f"  Equity simulada: ${float(last['equity']):,.2f}")
     print(f"  Retorno acum.:   {float(last['retorno_acumulado_pct']):+.2f}%")
+    print(f"  Drawdown atual:  {final_dd*100:+.2f}%  (limite: {-MAX_DRAWDOWN_HALT*100:.0f}%)")
     print(f"  Trades totais:   {int(last['n_trades'])}")
+
+    if str(last["decisao"]) == "HALTED":
+        print()
+        print("  " + "!" * 51)
+        print("  CIRCUIT BREAKER ATIVO — agente PARADO (nao abre posicao).")
+        print(f"  Drawdown {final_dd*100:.2f}% ultrapassou o limite de projeto.")
+        print("  O log segue sendo registrado apenas como historico.")
+        print("  " + "!" * 51)
 
 
 def ts_floor(ts) -> pd.Timestamp:

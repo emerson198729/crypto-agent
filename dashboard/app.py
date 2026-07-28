@@ -62,6 +62,18 @@ st.caption(
 )
 
 # ------------------------------------------------------------------
+# Aviso de circuit breaker — agente parado por drawdown
+# ------------------------------------------------------------------
+if str(df["decisao"].iloc[-1]) == "HALTED":
+    st.error(
+        "**AGENTE PARADO — circuit breaker ativo.** O drawdown ultrapassou o "
+        "limite de risco do projeto (-25%), entao o agente foi encerrado e nao "
+        "abre mais posicoes. A equity permanece congelada de proposito: os "
+        "graficos abaixo sao o **registro historico** do experimento, nao "
+        "operacao ao vivo."
+    )
+
+# ------------------------------------------------------------------
 # Metricas principais
 # ------------------------------------------------------------------
 
